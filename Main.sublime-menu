@@ -1,0 +1,28 @@
+[
+    {
+        "caption": "Tools",
+        "mnemonic": "T",
+        "id": "tools",
+        "children":
+        [
+            {
+                "caption": "WezTerm Bridge",
+                "children":
+                [
+                    {
+                        "caption": "Send Prompt to WezTerm",
+                        "command": "wezterm_bridge_send_prompt"
+                    },
+                    {
+                        "caption": "Show WezTerm Panes",
+                        "command": "wezterm_bridge_choose_pane"
+                    },
+                    {
+                        "caption": "Test Plugin",
+                        "command": "wezterm_bridge_test"
+                    }
+                ]
+            }
+        ]
+    }
+]

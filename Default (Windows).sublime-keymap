@@ -1,0 +1,17 @@
+[
+    {
+        "keys": ["ctrl+enter"],
+        "command": "wezterm_bridge_send_prompt"
+    },
+    {
+        "keys": ["ctrl+shift+enter"],
+        "command": "wezterm_bridge_send_to_last"
+    },
+    {
+        "keys": ["ctrl+alt+enter"],
+        "command": "wezterm_bridge_send_prompt",
+        "args": {
+            "submit": false
+        }
+    }
+]
