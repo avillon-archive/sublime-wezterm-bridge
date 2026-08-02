@@ -9,14 +9,13 @@ import sublime_plugin
 
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+PROCESS_TIMEOUT_SECONDS = 2.0
 
 # Cached live WezTerm GUI socket.
 _wezterm_socket = None
 
 # Memory-only "last selected pane".
 # This intentionally does NOT persist across Sublime restarts.
-# Before reusing it, we re-fetch the current pane list and verify identity
-# metadata so a recycled pane_id after a WezTerm restart cannot misroute text.
 _last_pane = None
 
 
@@ -37,6 +36,13 @@ def _base_env(socket_path=None):
 
 
 def _run_process(args, input_text=None, env=None):
+    """
+    Run a WezTerm CLI command.
+
+    All callers must invoke this from Sublime's async worker thread. The
+    timeout prevents a stale WezTerm socket from blocking the plugin host
+    indefinitely.
+    """
     return subprocess.run(
         args,
         input=input_text,
@@ -45,9 +51,29 @@ def _run_process(args, input_text=None, env=None):
         encoding="utf-8",
         errors="replace",
         check=True,
+        timeout=PROCESS_TIMEOUT_SECONDS,
         creationflags=CREATE_NO_WINDOW,
         env=env,
     )
+
+
+def _run_async(worker, on_success=None, on_error=None):
+    """
+    Execute blocking work on Sublime's worker thread and marshal callbacks
+    back to the main thread.
+    """
+    def task():
+        try:
+            result = worker()
+        except Exception as exc:
+            if on_error:
+                sublime.set_timeout(lambda: on_error(exc), 0)
+            return
+
+        if on_success:
+            sublime.set_timeout(lambda: on_success(result), 0)
+
+    sublime.set_timeout_async(task, 0)
 
 
 def _socket_candidates():
@@ -101,7 +127,12 @@ def find_wezterm_socket(force=False):
                 _wezterm_socket = socket_path
                 return socket_path
 
-        except (subprocess.CalledProcessError, OSError, ValueError):
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+            ValueError,
+        ):
             continue
 
     _wezterm_socket = None
@@ -127,7 +158,7 @@ def run_wezterm(args, input_text=None, retry=True):
             env=_base_env(socket_path),
         )
 
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         # WezTerm may have restarted and received a new gui-sock number.
         _wezterm_socket = None
 
@@ -143,51 +174,49 @@ def run_wezterm(args, input_text=None, retry=True):
         raise
 
 
-def get_wezterm_panes(show_errors=True):
-    try:
-        result = run_wezterm(
-            ["cli", "list", "--format", "json"]
+def get_wezterm_panes():
+    result = run_wezterm(
+        ["cli", "list", "--format", "json"]
+    )
+
+    panes = json.loads(result.stdout)
+
+    if not isinstance(panes, list):
+        raise ValueError("Unexpected WezTerm response")
+
+    return panes
+
+
+def _error_message_for_exception(exc, action):
+    if isinstance(exc, FileNotFoundError):
+        return (
+            "WezTerm Bridge\n\n"
+            "wezterm.exe를 찾을 수 없습니다.\n"
+            "WezTerm이 PATH에 등록되어 있는지 확인하세요."
         )
 
-        panes = json.loads(result.stdout)
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return (
+            "WezTerm Bridge\n\n"
+            "WezTerm이 응답하지 않아 작업을 중단했습니다.\n"
+            "WezTerm이 실행 중인지 확인하세요."
+        )
 
-        if not isinstance(panes, list):
-            raise ValueError("Unexpected WezTerm response")
+    if isinstance(exc, subprocess.CalledProcessError):
+        details = exc.stderr or exc.stdout or str(exc)
+        return "WezTerm Bridge\n\n{}\n\n{}".format(action, details)
 
-        return panes
+    if isinstance(exc, (json.JSONDecodeError, ValueError)):
+        return (
+            "WezTerm Bridge\n\n"
+            "WezTerm의 JSON 응답을 해석하지 못했습니다.\n\n"
+            + str(exc)
+        )
 
-    except FileNotFoundError:
-        if show_errors:
-            sublime.error_message(
-                "WezTerm Bridge\n\n"
-                "wezterm.exe를 찾을 수 없습니다.\n"
-                "WezTerm이 PATH에 등록되어 있는지 확인하세요."
-            )
+    if isinstance(exc, RuntimeError):
+        return "WezTerm Bridge\n\n" + str(exc)
 
-    except subprocess.CalledProcessError as exc:
-        if show_errors:
-            message = exc.stderr or exc.stdout or str(exc)
-            sublime.error_message(
-                "WezTerm Bridge\n\n"
-                "WezTerm 세션 목록을 가져오지 못했습니다.\n\n"
-                + message
-            )
-
-    except (json.JSONDecodeError, ValueError) as exc:
-        if show_errors:
-            sublime.error_message(
-                "WezTerm Bridge\n\n"
-                "WezTerm의 JSON 응답을 해석하지 못했습니다.\n\n"
-                + str(exc)
-            )
-
-    except RuntimeError as exc:
-        if show_errors:
-            sublime.error_message(
-                "WezTerm Bridge\n\n" + str(exc)
-            )
-
-    return []
+    return "WezTerm Bridge\n\n{}\n\n{}".format(action, str(exc))
 
 
 def cwd_for_display(cwd):
@@ -276,9 +305,6 @@ def pane_identity(pane):
     """
     Metadata used to verify that a remembered pane_id still refers to the
     same logical pane.
-
-    pane_id alone is NOT sufficient because WezTerm may reuse small IDs after
-    a restart. We therefore require stable metadata to match as well.
     """
     return {
         "pane_id": pane.get("pane_id"),
@@ -300,13 +326,6 @@ def clear_last_pane():
 
 
 def find_verified_last_pane(panes):
-    """
-    Return the current pane matching the remembered pane only if both pane_id
-    and identity metadata still match.
-
-    This prevents a recycled pane_id after WezTerm restart from receiving a
-    prompt intended for an old session.
-    """
     if not _last_pane:
         return None
 
@@ -344,60 +363,56 @@ def get_prompt_text(view):
 
 
 def send_text_to_pane(pane_id, text, submit=True):
-    try:
-        # Prompt body: use bracketed paste for multiline safety.
+    # Prompt body: use bracketed paste for multiline safety.
+    run_wezterm(
+        [
+            "cli",
+            "send-text",
+            "--pane-id",
+            str(pane_id),
+        ],
+        input_text=text,
+    )
+
+    if submit:
+        # Send a raw Enter separately, outside bracketed paste.
         run_wezterm(
             [
                 "cli",
                 "send-text",
                 "--pane-id",
                 str(pane_id),
+                "--no-paste",
             ],
-            input_text=text,
+            input_text="\r",
         )
 
-        if submit:
-            # Send a raw Enter separately, outside bracketed paste.
-            run_wezterm(
-                [
-                    "cli",
-                    "send-text",
-                    "--pane-id",
-                    str(pane_id),
-                    "--no-paste",
-                ],
-                input_text="\r",
-            )
-
-        return True
-
-    except FileNotFoundError:
-        sublime.error_message(
-            "WezTerm Bridge\n\n"
-            "wezterm.exe를 찾을 수 없습니다."
-        )
-
-    except subprocess.CalledProcessError as exc:
-        message = exc.stderr or exc.stdout or str(exc)
-        sublime.error_message(
-            "WezTerm Bridge\n\n"
-            "프롬프트 전송에 실패했습니다.\n\n"
-            + message
-        )
-
-    except RuntimeError as exc:
-        sublime.error_message(
-            "WezTerm Bridge\n\n" + str(exc)
-        )
-
-    return False
+    return True
 
 
 class _PanePickerMixin:
-    def _show_pane_picker(self, prompt_text, submit=True):
+    def _load_and_show_pane_picker(self, prompt_text, submit=True):
         self.prompt_text = prompt_text
         self.submit = submit
-        self.panes = get_wezterm_panes()
+
+        sublime.status_message("WezTerm Bridge: pane 목록을 불러오는 중...")
+
+        _run_async(
+            get_wezterm_panes,
+            on_success=self._show_pane_picker,
+            on_error=self._on_load_panes_error,
+        )
+
+    def _on_load_panes_error(self, exc):
+        sublime.error_message(
+            _error_message_for_exception(
+                exc,
+                "WezTerm 세션 목록을 가져오지 못했습니다.",
+            )
+        )
+
+    def _show_pane_picker(self, panes):
+        self.panes = panes
 
         if not self.panes:
             sublime.status_message(
@@ -432,34 +447,42 @@ class _PanePickerMixin:
             )
             return
 
-        if send_text_to_pane(
-            pane_id,
-            self.prompt_text,
-            submit=self.submit,
-        ):
-            remember_pane(pane)
+        sublime.status_message("WezTerm Bridge: 프롬프트를 전송하는 중...")
 
-            suffix = "" if self.submit else " (전송만)"
-            sublime.status_message(
-                "WezTerm Bridge → {}{}".format(
-                    pane_primary_label(pane),
-                    suffix,
-                )
+        _run_async(
+            lambda: send_text_to_pane(
+                pane_id,
+                self.prompt_text,
+                submit=self.submit,
+            ),
+            on_success=lambda _: self._on_send_success(pane),
+            on_error=self._on_send_error,
+        )
+
+    def _on_send_success(self, pane):
+        remember_pane(pane)
+
+        suffix = "" if self.submit else " (전송만)"
+        sublime.status_message(
+            "WezTerm Bridge → {}{}".format(
+                pane_primary_label(pane),
+                suffix,
             )
+        )
+
+    def _on_send_error(self, exc):
+        sublime.error_message(
+            _error_message_for_exception(
+                exc,
+                "프롬프트 전송에 실패했습니다.",
+            )
+        )
 
 
 class WeztermBridgeSendPromptCommand(
     _PanePickerMixin,
     sublime_plugin.WindowCommand,
 ):
-    """
-    Ctrl+Enter:
-      pane 목록 -> 선택 -> 전송 + Enter
-
-    Ctrl+Alt+Enter:
-      pane 목록 -> 선택 -> 전송만 (submit=false)
-    """
-
     def run(self, submit=True):
         view = self.window.active_view()
 
@@ -477,7 +500,7 @@ class WeztermBridgeSendPromptCommand(
             )
             return
 
-        self._show_pane_picker(
+        self._load_and_show_pane_picker(
             prompt_text,
             submit=bool(submit),
         )
@@ -487,13 +510,6 @@ class WeztermBridgeSendToLastCommand(
     _PanePickerMixin,
     sublime_plugin.WindowCommand,
 ):
-    """
-    Ctrl+Shift+Enter:
-      - Re-fetch the current pane list.
-      - Reuse the remembered pane ONLY if pane_id + metadata still match.
-      - Otherwise clear the stale target and fall back to the pane picker.
-    """
-
     def run(self):
         view = self.window.active_view()
 
@@ -503,16 +519,28 @@ class WeztermBridgeSendToLastCommand(
             )
             return
 
-        prompt_text = get_prompt_text(view)
+        self.prompt_text = get_prompt_text(view)
+        self.submit = True
 
-        if not prompt_text.strip():
+        if not self.prompt_text.strip():
             sublime.status_message(
                 "WezTerm Bridge: 전송할 텍스트가 없습니다."
             )
             return
 
-        panes = get_wezterm_panes()
+        sublime.status_message("WezTerm Bridge: 마지막 pane을 확인하는 중...")
+
+        _run_async(
+            get_wezterm_panes,
+            on_success=self._on_last_panes_loaded,
+            on_error=self._on_load_panes_error,
+        )
+
+    def _on_last_panes_loaded(self, panes):
         if not panes:
+            sublime.status_message(
+                "WezTerm Bridge: 실행 중인 pane을 찾지 못했습니다."
+            )
             return
 
         pane = find_verified_last_pane(panes)
@@ -522,35 +550,45 @@ class WeztermBridgeSendToLastCommand(
             sublime.status_message(
                 "WezTerm Bridge: 마지막 세션이 없거나 변경되어 다시 선택합니다."
             )
-            self._show_pane_picker(prompt_text, submit=True)
+            self._show_pane_picker(panes)
             return
 
         pane_id = pane.get("pane_id")
+        if pane_id is None:
+            clear_last_pane()
+            self._show_pane_picker(panes)
+            return
 
-        if send_text_to_pane(
-            pane_id,
-            prompt_text,
-            submit=True,
-        ):
-            # Refresh remembered metadata from the current pane snapshot.
-            remember_pane(pane)
-            sublime.status_message(
-                "WezTerm Bridge → {}".format(
-                    pane_primary_label(pane)
-                )
-            )
+        sublime.status_message("WezTerm Bridge: 프롬프트를 전송하는 중...")
+
+        _run_async(
+            lambda: send_text_to_pane(
+                pane_id,
+                self.prompt_text,
+                submit=True,
+            ),
+            on_success=lambda _: self._on_send_success(pane),
+            on_error=self._on_send_error,
+        )
 
 
 class WeztermBridgeChoosePaneCommand(sublime_plugin.WindowCommand):
-    """
-    Helper/debug command. Ctrl+Enter already doubles as a pane-list viewer
-    because Esc cancels without sending.
-    """
-
     def run(self):
-        self.panes = get_wezterm_panes()
+        sublime.status_message("WezTerm Bridge: pane 목록을 불러오는 중...")
 
-        if not self.panes:
+        _run_async(
+            get_wezterm_panes,
+            on_success=self._show_panes,
+            on_error=self._on_error,
+        )
+
+    def _show_panes(self, panes):
+        self.panes = panes
+
+        if not panes:
+            sublime.status_message(
+                "WezTerm Bridge: 실행 중인 pane을 찾지 못했습니다."
+            )
             return
 
         items = [
@@ -558,12 +596,20 @@ class WeztermBridgeChoosePaneCommand(sublime_plugin.WindowCommand):
                 pane_primary_label(pane),
                 pane_secondary_label(pane),
             ]
-            for pane in self.panes
+            for pane in panes
         ]
 
         self.window.show_quick_panel(
             items,
             self.on_selected,
+        )
+
+    def _on_error(self, exc):
+        sublime.error_message(
+            _error_message_for_exception(
+                exc,
+                "WezTerm 세션 목록을 가져오지 못했습니다.",
+            )
         )
 
     def on_selected(self, index):
@@ -589,6 +635,15 @@ class WeztermBridgeForgetLastCommand(sublime_plugin.ApplicationCommand):
 
 class WeztermBridgeTestCommand(sublime_plugin.ApplicationCommand):
     def run(self):
+        sublime.status_message("WezTerm Bridge: 연결을 확인하는 중...")
+
+        _run_async(
+            self._build_test_message,
+            on_success=sublime.message_dialog,
+            on_error=self._on_error,
+        )
+
+    def _build_test_message(self):
         import sys
 
         socket_path = find_wezterm_socket()
@@ -607,4 +662,12 @@ class WeztermBridgeTestCommand(sublime_plugin.ApplicationCommand):
                 "{}".format(_last_pane),
             ])
 
-        sublime.message_dialog("\n".join(message))
+        return "\n".join(message)
+
+    def _on_error(self, exc):
+        sublime.error_message(
+            _error_message_for_exception(
+                exc,
+                "WezTerm 연결 확인에 실패했습니다.",
+            )
+        )
